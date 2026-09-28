@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -100,6 +101,9 @@ func (s *Service) CreateCampaign(in CreateCampaignInput) (Campaign, CampaignSnap
 	if in.MaxFailureRate < 0 || in.MaxFailureRate > 1 {
 		return Campaign{}, CampaignSnapshot{}, wrapError("CreateCampaign", ErrInvalidArgument, "max failure rate must be in [0,1]")
 	}
+	if in.MaxWaveFailures < 0 {
+		return Campaign{}, CampaignSnapshot{}, wrapError("CreateCampaign", ErrInvalidArgument, "max wave failures must be >= 0")
+	}
 	sel := in.DeviceSelector
 	if sel.Model == "" {
 		return Campaign{}, CampaignSnapshot{}, wrapError("CreateCampaign", ErrInvalidArgument, "device selector model is required")
@@ -130,6 +134,7 @@ func (s *Service) CreateCampaign(in CreateCampaignInput) (Campaign, CampaignSnap
 
 		var deviceIDs []string
 		var busy []string
+		selected := map[string]Device{}
 		for _, d := range tx.ListDevices() {
 			if !qualified(d, sel, fw.Version, allowed) {
 				continue
@@ -139,6 +144,7 @@ func (s *Service) CreateCampaign(in CreateCampaignInput) (Campaign, CampaignSnap
 				continue
 			}
 			deviceIDs = append(deviceIDs, d.ID)
+			selected[d.ID] = d
 		}
 		if len(deviceIDs) == 0 {
 			return wrapError("CreateCampaign", ErrConflict,
@@ -148,20 +154,21 @@ func (s *Service) CreateCampaign(in CreateCampaignInput) (Campaign, CampaignSnap
 		waves := splitWaves(deviceIDs, in.BatchSize)
 		now := s.now()
 		c := Campaign{
-			ID:             in.ID,
-			FirmwareID:     fw.ID,
-			Model:          fw.Model,
-			TargetVersion:  fw.Version,
-			FirmwareDigest: fw.Checksum(),
-			Status:         CampaignStatusActive,
-			CurrentWave:    1,
-			TotalWaves:     len(waves),
-			Version:        1,
-			SuccessRate:    in.SuccessRateThreshold,
-			MaxFailureRate: in.MaxFailureRate,
-			BatchSize:      in.BatchSize,
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			ID:              in.ID,
+			FirmwareID:      fw.ID,
+			Model:           fw.Model,
+			TargetVersion:   fw.Version,
+			FirmwareDigest:  fw.Checksum(),
+			Status:          CampaignStatusActive,
+			CurrentWave:     1,
+			TotalWaves:      len(waves),
+			Version:         1,
+			SuccessRate:     in.SuccessRateThreshold,
+			MaxFailureRate:  in.MaxFailureRate,
+			MaxWaveFailures: in.MaxWaveFailures,
+			BatchSize:       in.BatchSize,
+			CreatedAt:       now,
+			UpdatedAt:       now,
 		}
 		snap = CampaignSnapshot{
 			CampaignID:     c.ID,
@@ -176,13 +183,16 @@ func (s *Service) CreateCampaign(in CreateCampaignInput) (Campaign, CampaignSnap
 
 		for waveIdx, ids := range waves {
 			for _, id := range ids {
+				d := selected[id]
 				u := DeviceUpgrade{
-					DeviceID:       id,
-					CampaignID:     c.ID,
-					Wave:           waveIdx + 1,
-					Status:         UpgradeStatusPending,
-					TargetVersion:  c.TargetVersion,
-					IdempotencyKey: stableKey(c.ID, id),
+					DeviceID:        id,
+					CampaignID:      c.ID,
+					Wave:            waveIdx + 1,
+					Status:          UpgradeStatusPending,
+					TargetVersion:   c.TargetVersion,
+					IdempotencyKey:  stableKey(c.ID, id),
+					FromVersion:     d.CurrentVersion,
+					RollbackAllowed: d.RollbackSupported,
 				}
 				tx.PutUpgrade(u)
 				tx.LockDevice(id, c.ID) // 同事务内锁定，互斥活动无法重复纳入
@@ -414,8 +424,13 @@ func (s *Service) SubmitReceipt(in ReceiptInput) error {
 			}
 		}
 
-		// 仅活动中的当前波次触发结算评估；中止后只记录结果。
+		// 仅活动中的当前波次触发结算评估；中止/回退后只记录结果。
 		if c.Status == CampaignStatusActive {
+			// 失败计数熔断优先：越过本批失败上限的同一事务内原子停止下发
+			// 并生成回退指令，此后不再做波次推进/自动暂停评估。
+			if s.triggerRollbackIfExceeded(tx, &c) {
+				return nil
+			}
 			s.evaluateWave(tx, &c)
 		}
 		return nil
@@ -497,6 +512,123 @@ func (s *Service) evaluateWave(tx TxStore, c *Campaign) {
 	}))
 }
 
+// ---- 自动回退（失败计数熔断）----
+
+// triggerRollbackIfExceeded 必须在事务内、活动处于 active 时调用。
+// 当前波失败台数严格越过 MaxWaveFailures 时原子进入 rolling_back：
+// 停止全部后续下发、对本批设备做一次性分类、为已安装成功且允许回退者
+// 生成回退指令。返回 true 表示已触发（调用方不得再做波次推进评估）。
+func (s *Service) triggerRollbackIfExceeded(tx TxStore, c *Campaign) bool {
+	if c.MaxWaveFailures <= 0 {
+		return false
+	}
+	_, _, failed := s.waveCounts(tx, c.ID, c.CurrentWave)
+	if failed <= c.MaxWaveFailures {
+		return false
+	}
+	s.enterRollback(tx, c, failed)
+	return true
+}
+
+// enterRollback 在当前事务内把活动切到 rolling_back，并对当前波设备做
+// 一次性、冻结的分类。以前波次不受影响。
+func (s *Service) enterRollback(tx TxStore, c *Campaign, failed int) {
+	now := s.now()
+	c.Status = CampaignStatusRollingBack
+	c.Version++
+	c.UpdatedAt = now
+	c.RollbackWave = c.CurrentWave
+	c.RollbackReason = fmt.Sprintf("wave %d failures %d exceed limit %d",
+		c.CurrentWave, failed, c.MaxWaveFailures)
+
+	installed, inProgress := 0, 0
+	for _, u := range tx.ListUpgrades(c.ID) {
+		if u.Wave != c.CurrentWave {
+			continue // 以前完成的批次不受影响
+		}
+		switch u.Status {
+		case UpgradeStatusSucceeded:
+			installed++
+			if u.RollbackAllowed && u.FromVersion != "" {
+				u.RollbackState = RollbackStateCommand
+			} else {
+				u.RollbackState = RollbackStateSkipped
+			}
+		case UpgradeStatusFailed:
+			u.RollbackState = RollbackStateFailed
+		default: // pending / issued：触发时仍在处理中
+			inProgress++
+			u.RollbackState = RollbackStateInProgress
+		}
+		tx.PutUpgrade(u)
+	}
+
+	tx.PutCampaign(*c)
+	notified := s.emitRollbackCommands(tx, *c)
+	// 活动进入终态：与中止一致释放全部设备锁（在途回执仍会被接受）。
+	for _, u := range tx.ListUpgrades(c.ID) {
+		tx.UnlockDevice(u.DeviceID, c.ID)
+	}
+	tx.AddOutbox(mustEvent(EventWaveRollingBack, c.ID, "", map[string]any{
+		"wave":        c.RollbackWave,
+		"reason":      c.RollbackReason,
+		"installed":   installed,
+		"in_progress": inProgress,
+		"failed":      failed,
+		"notified":    notified,
+	}))
+}
+
+// emitRollbackCommands 为所有已分类为 command 且尚未通知的设备生成带版本
+// 的回退指令，设置 RollbackNotified 并写入 outbox。触发与（崩溃恢复/重复
+// 扫描的）补偿走同一条幂等路径，因此每台设备至多发令一次。返回新发数。
+func (s *Service) emitRollbackCommands(tx TxStore, c Campaign) int {
+	notified := 0
+	for _, u := range tx.ListUpgrades(c.ID) {
+		if u.RollbackState != RollbackStateCommand || u.RollbackNotified {
+			continue
+		}
+		u.RollbackNotified = true
+		tx.PutUpgrade(u)
+		tx.AddOutbox(mustEvent(EventRollbackCommand, c.ID, u.DeviceID, map[string]any{
+			"wave":            u.Wave,
+			"from_version":    u.TargetVersion,
+			"to_version":      u.FromVersion,
+			"campaign_ver":    c.Version,
+			"idempotency_key": rollbackKey(c.ID, u.DeviceID),
+		}))
+		notified++
+	}
+	return notified
+}
+
+// ScanRollbackCommands 是补偿扫描入口（可被定时任务/重启恢复反复调用）：
+// 补发任何已分类但尚未通知的回退指令。正常路径上触发与通知在同一事务
+// 完成，因此扫描通常返回 0；它保证异常恢复时也不会重复发令。
+func (s *Service) ScanRollbackCommands(campaignID string) (int, error) {
+	if campaignID == "" {
+		return 0, wrapError("ScanRollbackCommands", ErrInvalidArgument, "campaign id is required")
+	}
+	notified := 0
+	err := s.repo.UpdateTx(func(tx TxStore) error {
+		c, err := tx.GetCampaign(campaignID)
+		if err != nil {
+			return wrapError("ScanRollbackCommands", ErrNotFound, "campaign %q", campaignID)
+		}
+		notified = s.emitRollbackCommands(tx, c)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return notified, nil
+}
+
+// rollbackKey 是回退指令的稳定幂等键，与升级指令键区分。
+func rollbackKey(campaignID, deviceID string) string {
+	return fmt.Sprintf("rb:%s:%s", campaignID, deviceID)
+}
+
 // ---- 暂停 / 恢复 / 中止 ----
 
 // Pause 手动暂停（仅 active → paused）。
@@ -544,6 +676,14 @@ func (s *Service) Resume(campaignID string) error {
 		if c.Status != CampaignStatusPaused {
 			return wrapError("Resume", ErrInvalidTransition, "campaign is %s", c.Status)
 		}
+
+		// 放行前先判断（含暂停期间累积的）失败是否已越过失败上限：若是则
+		// paused → rolling_back 单一原子结果，不发 resumed、不恢复下发。
+		// 判定不依赖波次收敛，未收敛时 pending/issued 设备归为处理中。
+		if s.triggerRollbackIfExceeded(tx, &c) {
+			return nil
+		}
+
 		now := s.now()
 		c.Status = CampaignStatusActive
 		c.Version++
@@ -625,6 +765,8 @@ func (s *Service) advanceOverride(tx TxStore, c *Campaign) {
 
 // Abort 中止活动。active/paused → aborted：版本号前进、释放全部
 // 设备锁、停止下发新指令；在途回执仍可到达且状态单调不变。
+// 已进入 rolling_back（自动回退终态）或 completed 的活动不可中止——
+// 自动回退与人工中止并发时只保留先提交的那一种结果。
 func (s *Service) Abort(campaignID, reason string) error {
 	if campaignID == "" {
 		return wrapError("Abort", ErrInvalidArgument, "campaign id is required")
@@ -634,7 +776,7 @@ func (s *Service) Abort(campaignID, reason string) error {
 		if err != nil {
 			return wrapError("Abort", ErrNotFound, "campaign %q", campaignID)
 		}
-		if c.Status == CampaignStatusAborted || c.Status == CampaignStatusCompleted {
+		if c.Status.Terminal() {
 			return wrapError("Abort", ErrInvalidTransition, "campaign is %s", c.Status)
 		}
 		now := s.now()
@@ -712,6 +854,24 @@ func (s *Service) GetProgress(campaignID string) (Progress, error) {
 		if st.Total > 0 {
 			st.SuccessRate = float64(st.Succeeded) / float64(st.Total)
 		}
+		// 触发回退的波次：附触发瞬间冻结的设备分类。
+		if c.RollbackWave == st.Wave && c.RollbackWave > 0 {
+			wr := &WaveRollback{Triggered: true}
+			for _, id := range ids {
+				switch byDevice[id].RollbackState {
+				case RollbackStateCommand, RollbackStateSkipped:
+					wr.Installed++
+				case RollbackStateInProgress:
+					wr.InProgress++
+				case RollbackStateFailed:
+					wr.Failed++
+				}
+				if byDevice[id].RollbackNotified {
+					wr.Notified++
+				}
+			}
+			st.Rollback = wr
+		}
 		p.Succeeded += st.Succeeded
 		p.Failed += st.Failed
 		p.InProgress += st.InProgress
@@ -721,7 +881,46 @@ func (s *Service) GetProgress(campaignID string) (Progress, error) {
 		p.SuccessRate = float64(p.Succeeded) / float64(p.Total)
 	}
 	p.Finished = c.Status == CampaignStatusCompleted
+	if c.Status == CampaignStatusRollingBack {
+		p.Rollback = s.buildRollbackReport(c, byDevice)
+	}
 	return p, nil
+}
+
+// buildRollbackReport 依据冻结的设备分类构建回退报告与带版本回退指令清单。
+func (s *Service) buildRollbackReport(c Campaign, byDevice map[string]DeviceUpgrade) *ProgressRollback {
+	r := &ProgressRollback{Wave: c.RollbackWave, Reason: c.RollbackReason}
+	for _, u := range byDevice {
+		if u.Wave != c.RollbackWave {
+			continue
+		}
+		switch u.RollbackState {
+		case RollbackStateCommand:
+			r.Installed++
+			if u.RollbackNotified {
+				r.Notified++
+			}
+			r.Commands = append(r.Commands, RollbackCommand{
+				CampaignID:     c.ID,
+				DeviceID:       u.DeviceID,
+				Wave:           u.Wave,
+				FromVersion:    u.TargetVersion,
+				ToVersion:      u.FromVersion,
+				CampaignVer:    c.Version,
+				IdempotencyKey: rollbackKey(c.ID, u.DeviceID),
+			})
+		case RollbackStateSkipped:
+			r.Installed++
+			r.Skipped = append(r.Skipped, u.DeviceID)
+		case RollbackStateInProgress:
+			r.InProgress++
+		case RollbackStateFailed:
+			r.Failed++
+		}
+	}
+	sort.Slice(r.Commands, func(i, j int) bool { return r.Commands[i].DeviceID < r.Commands[j].DeviceID })
+	sort.Strings(r.Skipped)
+	return r
 }
 
 // ---- Outbox ----
