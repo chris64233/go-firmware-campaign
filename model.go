@@ -22,7 +22,10 @@ type Device struct {
 	CurrentVersion string
 	BatteryLevel   int // 0-100
 	Status         DeviceStatus
-	UpdatedAt      time.Time
+	// RollbackAllowed 表示设备是否允许回退固件；为 false（零值）的设备
+	// 即使安装成功也不会收到自动回退指令，必须显式允许。
+	RollbackAllowed bool
+	UpdatedAt       time.Time
 }
 
 // Firmware 是登记过的固件。
@@ -53,17 +56,24 @@ func (f *Firmware) Checksum() string {
 //	active ──pause──> paused ──resume──> active
 //	  │                  │
 //	  ├──(末波达标)─────────────────────> completed
-//	  └──abort───────────┴──> aborted
+//	  ├──(本批失败数越限)────────────────> rolled_back（终态）
+//	  └──abort───────────┴──> aborted（终态）
 //
 // active 内部按波次推进；最后一波收敛达标后进入 completed（终态）。
 // 波次失败率超阈值时由系统自动转入 paused，等待运维 Resume 确认放行。
+// 当前波失败数越过 MaxFailuresPerWave 时，在处理失败回执的同一事务内
+// 原子转入 rolled_back：立即停止向后续设备下发，并为本波已安装成功
+// （succeeded）且冻结时允许回退的设备生成带版本的回退指令。
+// rolled_back 与 paused/aborted/completed 互斥：一切转移都在串行事务中
+// 进行，自动回退与人工暂停/中止并发时只有先提交的一种结果生效。
 type CampaignStatus string
 
 const (
-	CampaignStatusActive    CampaignStatus = "active"
-	CampaignStatusPaused    CampaignStatus = "paused"
-	CampaignStatusAborted   CampaignStatus = "aborted"
-	CampaignStatusCompleted CampaignStatus = "completed"
+	CampaignStatusActive     CampaignStatus = "active"
+	CampaignStatusPaused     CampaignStatus = "paused"
+	CampaignStatusAborted    CampaignStatus = "aborted"
+	CampaignStatusCompleted  CampaignStatus = "completed"
+	CampaignStatusRolledBack CampaignStatus = "rolled_back"
 )
 
 // 单台设备升级状态。状态只允许单调前进。
@@ -106,10 +116,19 @@ type DeviceUpgrade struct {
 	CampaignVer    int64 // 领取时记录的活动版本，回执必须匹配
 	IdempotencyKey string
 	TargetVersion  string
-	IssuedAt       time.Time
-	ResolvedAt     time.Time
-	FailureReason  string
-	Attempts       int
+	// FromVersion 在活动创建时冻结自设备当前版本，是自动回退指令要回到
+	// 的版本；活动期间设备快照变化不影响该值。
+	FromVersion string
+	// RollbackAllowed 在活动创建时冻结：只有显式允许回退的设备才可能
+	// 收到自动回退指令。
+	RollbackAllowed bool
+	// RollbackCommandSent 标记自动回退指令是否已生成（每台设备至多一次）；
+	// 重复扫描补偿集合与重启恢复都据此幂等，绝不重复发令。
+	RollbackCommandSent bool
+	IssuedAt            time.Time
+	ResolvedAt          time.Time
+	FailureReason       string
+	Attempts            int
 	// ReceiptVer 是已接受回执的最高活动版本水位，旧版本回执一律拒绝。
 	ReceiptVer int64
 	// CompensationSent 标记补偿通知是否已生成（每台设备至多一次）。
@@ -140,11 +159,17 @@ type Campaign struct {
 	Version        int64 // 活动版本号，每次状态/波次推进 +1
 	SuccessRate    float64
 	MaxFailureRate float64
-	BatchSize      int
-	PauseReason    string
+	// MaxFailuresPerWave 是每批失败数的硬上限（>0 时启用）：当前波失败
+	// 数一旦越过（>）该值，活动在同一事务原子转入 rolled_back。
+	MaxFailuresPerWave int
+	BatchSize          int
+	PauseReason        string
+	// RollbackReason 在触发自动回退时记录。
+	RollbackReason string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	AbortedAt      time.Time
+	RolledBackAt   time.Time
 }
 
 // CampaignSnapshot 是活动创建时冻结的完整内容（用于审计）。
@@ -174,6 +199,19 @@ type Progress struct {
 	PauseReason string
 	Waves       []WaveStat
 	Finished    bool // 所有波次设备均已进入终态（可能是 aborted 后全部收敛）
+	// 触发自动回退后，以下字段报告触发波次（本批）的设备分类：
+	// RollbackCommanded 为已安装成功、具备回退条件且已生成回退指令的设备；
+	// RollbackWaiting 为已安装成功、具备回退条件但回退指令尚未生成的设备
+	// （正常应为空；可用 ScanRollbackCommands 补发，重启恢复也不重复）；
+	// InstalledNotRollbackable 为已安装成功但不允许回退（冻结时
+	// RollbackAllowed=false）的设备，保持新版本不回退；
+	// RollbackInFlight 为仍在处理中（pending/issued）的设备，不产生回退；
+	// 本批已失败设备计入 Failed，不回退；以前完成波次的设备不受影响、不在其中。
+	RollbackCommanded        []string
+	RollbackWaiting          []string
+	InstalledNotRollbackable []string
+	RollbackInFlight         []string
+	RollbackReason           string
 }
 
 // 指令状态（与升级状态同源，面向设备的回执取值）。
@@ -202,6 +240,11 @@ type CreateCampaignInput struct {
 	BatchSize            int     // 每波设备数，>0
 	SuccessRateThreshold float64 // 当前波成功率达到该值才开放下一波，[0,1]
 	MaxFailureRate       float64 // 当前波失败率超过该值则自动暂停，[0,1]
+	// MaxFailuresPerWave 设置每批失败数硬上限，>0 启用。当前波失败数
+	// 一旦越过（>）该值，处理该失败回执的事务原子地将活动转入
+	// rolled_back：停止后续下发并生成本批回退指令；0 表示不启用该保护，
+	// 仅保留按失败率自动暂停的行为。
+	MaxFailuresPerWave int
 }
 
 // DeviceSelector 是设备资格条件。
@@ -251,13 +294,17 @@ type OutboxEvent struct {
 
 // 事件类型。
 const (
-	EventCampaignCreated   = "campaign.created"
-	EventCampaignPaused    = "campaign.paused"
-	EventCampaignResumed   = "campaign.resumed"
-	EventCampaignAborted   = "campaign.aborted"
-	EventWaveAdvanced      = "campaign.wave_advanced"
-	EventCampaignCompleted = "campaign.completed"
-	EventUpgradeSucceeded  = "upgrade.succeeded"
-	EventUpgradeFailed     = "upgrade.failed"
-	EventCompensation      = "upgrade.compensation"
+	EventCampaignCreated    = "campaign.created"
+	EventCampaignPaused     = "campaign.paused"
+	EventCampaignResumed    = "campaign.resumed"
+	EventCampaignAborted    = "campaign.aborted"
+	EventCampaignRolledBack = "campaign.rolled_back"
+	EventWaveAdvanced       = "campaign.wave_advanced"
+	EventCampaignCompleted  = "campaign.completed"
+	EventUpgradeSucceeded   = "upgrade.succeeded"
+	EventUpgradeFailed      = "upgrade.failed"
+	EventCompensation       = "upgrade.compensation"
+	// EventRollbackCommand 是自动回退指令（面向设备，带安装版本与回退版本）。
+	// 每台设备至多产生一条；重复扫描与重启恢复均幂等。
+	EventRollbackCommand = "rollback.command"
 )
